@@ -1,0 +1,25 @@
+# Local project notes and editor rules
+/记忆.md
+/.cursor/
+
+# Machine-specific shortcuts
+*.lnk
+
+# Runtime output may contain machine and network details
+/preview.png
+*.log
+/log.txt
+/window.json
+
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and operating system files
+/.vscode/
+Thumbs.db
+Desktop.ini
+*.tmp
