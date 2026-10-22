@@ -2,40 +2,30 @@
 
 function Convert-ToCelsius {
     param([double]$Raw)
-    if ($Raw -le 0) { return $null }
+    if ([double]::IsNaN($Raw) -or [double]::IsInfinity($Raw) -or $Raw -le 0) { return $null }
     if ($Raw -gt 1000) { $Raw = $Raw / 10.0 }
-    if ($Raw -gt 200) { return [math]::Round($Raw - 273.15, 1) }
+    if ($Raw -gt 200) { $Raw -= 273.15 }
+    if ($Raw -lt -40 -or $Raw -gt 150) { return $null }
     return [math]::Round($Raw, 1)
 }
 
 function Format-UptimeText {
     param([TimeSpan]$Span)
     if ($Span.TotalDays -ge 1) {
-        return ('已开机 {0}天{1}小时' -f [int]$Span.TotalDays, $Span.Hours)
+        return ('已开机 {0}天{1}小时' -f $Span.Days, $Span.Hours)
     }
     if ($Span.TotalHours -ge 1) {
-        return ('已开机 {0}小时{1}分' -f [int]$Span.TotalHours, $Span.Minutes)
+        return ('已开机 {0}小时{1}分' -f [math]::Floor($Span.TotalHours), $Span.Minutes)
     }
-    return ('已开机 {0}分钟' -f [math]::Max(1, [int]$Span.TotalMinutes))
+    return ('已开机 {0}分钟' -f [math]::Max(1, [math]::Floor($Span.TotalMinutes)))
 }
 
-function Get-CounterMap {
-    param([string[]]$Paths)
-    $map = @{}
-    try {
-        $set = Get-Counter -Counter $Paths -ErrorAction Stop
-        foreach ($sample in $set.CounterSamples) {
-            $map[$sample.Path.ToLowerInvariant()] = $sample
-        }
-    } catch {
-    }
-    return $map
-}
+. (Join-Path $PSScriptRoot 'counter-reader.ps1')
 
 function Initialize-SpiritSensors {
     if ($script:SpiritReady) { return }
-    $script:Boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    $script:NetTracks = @()
+    try { $script:Boot = (Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 -ErrorAction Stop).LastBootUpTime }
+    catch { $script:Boot = $null }
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         $script:HasForms = $true
@@ -67,23 +57,9 @@ namespace SpiritNative {
 "@
     }
     try {
-        $net = Get-Counter '\Network Interface(*)\Bytes Received/sec' -ErrorAction Stop
-        $tracks = @()
-        foreach ($sample in $net.CounterSamples) {
-            $name = [string]$sample.InstanceName
-            if ($name -match 'isatap|teredo|loopback|pseudo|vethernet|wsl|bluetooth|vpn|miniport') { continue }
-            $down = $sample.Path
-            $up = $down -replace 'bytes received/sec$', 'bytes sent/sec'
-            $tracks += @{ Name = $name; Down = $down; Up = $up }
-        }
-        $script:NetTracks = $tracks
-    } catch {
-        $script:NetTracks = @()
-    }
-    try {
-        $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-        $cs = Get-CimInstance Win32_ComputerSystem
-        $gpu = Get-CimInstance Win32_VideoController | Select-Object -First 1
+        $cpu = Get-CimInstance Win32_Processor -OperationTimeoutSec 3 -ErrorAction Stop | Select-Object -First 1
+        $cs = Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec 3 -ErrorAction Stop
+        $gpu = Get-CimInstance Win32_VideoController -OperationTimeoutSec 3 -ErrorAction Stop | Select-Object -First 1
         $script:MachineLine = ('{0} {1}' -f $cs.Manufacturer, $cs.Model).Trim()
         $script:CpuName = ($cpu.Name -replace '\(R\)|\(TM\)', '' -replace '\s+', ' ').Trim()
         $script:GpuName = ($gpu.Name -replace '\(R\)|\(TM\)', '' -replace '\s+', ' ').Trim()
@@ -107,8 +83,10 @@ function Get-PreferredIPv4 {
     $bestIp = ''
     $bestScore = -1
     foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        try {
         if ($nic.OperationalStatus.ToString() -ne 'Up') { continue }
         if ($nic.NetworkInterfaceType.ToString() -eq 'Loopback') { continue }
+        if (($nic.Name + ' ' + $nic.Description) -match 'vmware|virtualbox|hyper-v|vethernet|bluetooth|wsl|wintun|wireguard|tap-windows|tailscale|zerotier') { continue }
         $addr = ''
         $props = $nic.GetIPProperties()
         foreach ($uni in $props.UnicastAddresses) {
@@ -131,6 +109,7 @@ function Get-PreferredIPv4 {
             $bestScore = $score
             $bestIp = $addr
         }
+        } catch { continue }
     }
     return $bestIp
 }
@@ -139,6 +118,7 @@ function Get-WifiVpn {
     $result = @{ Wifi = ''; Vpn = ''; VpnOn = $false; VpnName = ''; VpnIps = @() }
     $vpnIps = New-Object System.Collections.Generic.List[string]
     foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        try {
         if ($nic.OperationalStatus.ToString() -ne 'Up') { continue }
         if ($nic.NetworkInterfaceType.ToString() -eq 'Loopback') { continue }
         $name = [string]$nic.Name
@@ -165,6 +145,7 @@ function Get-WifiVpn {
             if (-not $result.VpnName) { $result.VpnName = $name }
             if (-not $vpnIps.Contains($addr)) { [void]$vpnIps.Add($addr) }
         }
+        } catch { continue }
     }
     $result.VpnIps = @($vpnIps)
     return $result
@@ -202,72 +183,71 @@ function Resolve-Place {
 
 function Update-IpCountry {
     param([string]$LocalIp)
-    $now = Get-Date
-    if ($script:Geo -and $script:GeoAt -and $script:GeoLocal -eq $LocalIp -and (($now - $script:GeoAt).TotalMinutes -lt 15)) {
-        return $script:Geo
+    $now = [datetime]::UtcNow
+    if ($script:GeoLocal -ne $LocalIp) {
+        $script:Geo = $null
+        $script:GeoNext = $null
+        $script:GeoLocal = $LocalIp
     }
-    $geo = @{ Code = ''; Name = ''; PublicIp = '' }
+    if ($script:GeoNext -and $now -lt $script:GeoNext) { return $script:Geo }
+    # Failures are cached too; never attach a previous network's location to a new one.
+    $script:GeoNext = $now.AddSeconds(60)
+    $script:Geo = @{ Code = ''; Name = ''; PublicIp = '' }
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $info = $null
-        try {
-            $raw = Invoke-RestMethod -Uri 'http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,query' -TimeoutSec 5
-            if ($raw.status -eq 'success' -and $raw.countryCode) {
-                $info = [pscustomobject]@{
-                    country_code = [string]$raw.countryCode
-                    country      = [string]$raw.country
-                    region       = [string]$raw.regionName
-                    city         = [string]$raw.city
-                    public_ip    = [string]$raw.query
-                }
-            }
-        } catch {}
-        if (-not $info) {
-            $raw = Invoke-RestMethod -Uri 'https://ipwho.is/' -TimeoutSec 5
-            if ($raw.success -and $raw.country_code) {
-                $info = $raw
-                $info | Add-Member -NotePropertyName public_ip -NotePropertyValue ([string]$raw.ip) -Force
-            }
-        }
-        if ($info -and $info.country_code) {
-            $place = Resolve-Place $info
-            $geo.Code = $place.Code
-            $geo.Name = $place.English
-            $geo.PublicIp = [string]$info.public_ip
-        }
-    } catch {
-        if ($script:Geo) { return $script:Geo }
+        $info = Invoke-RestMethod -Uri 'https://ipwho.is/' -TimeoutSec 5 -ErrorAction Stop
+        if (-not $info.success -or -not $info.country_code) { return $script:Geo }
+        $place = Resolve-Place $info
+        $script:Geo = @{ Code = $place.Code; Name = $place.English; PublicIp = [string]$info.ip }
+        $script:GeoNext = $now.AddMinutes(15)
+    } catch { } # Optional service: background worker retries after the backoff.
+    return $script:Geo
+}
+
+function Get-GpuAggregate {
+    param($Samples)
+    $engines = @{}
+    foreach ($sample in $Samples) {
+        $name = [string]$sample.InstanceName
+        if ($name -notmatch '(luid_0x[0-9a-f]+_0x[0-9a-f]+_phys_\d+_eng_\d+)') { continue }
+        $key = $Matches[1]
+        if (-not $engines.ContainsKey($key)) { $engines[$key] = 0.0 }
+        $engines[$key] += [math]::Max(0, [double]$sample.CookedValue)
     }
-    $script:Geo = $geo
-    $script:GeoAt = $now
-    $script:GeoLocal = $LocalIp
-    return $geo
+    if ($engines.Count -eq 0) { return $null }
+    # Sum processes on the same physical engine, then select the busiest engine.
+    $best = ($engines.Values | Measure-Object -Maximum).Maximum
+    return [math]::Round([math]::Min(100, $best), 0)
 }
 
 function Get-SpiritSnapshot {
+    param($GeoResult)
     Initialize-SpiritSensors
     $snap = @{
         MachineLine = $script:MachineLine
         CpuName     = $script:CpuName
         GpuName     = $script:GpuName
-        UptimeText  = Format-UptimeText ((Get-Date) - $script:Boot)
-        Cpu         = 0.0
+        UptimeText  = if ($script:Boot) { Format-UptimeText ((Get-Date) - $script:Boot) } else { '开机时间未知' }
+        Cpu         = $null
         CpuMhz      = $null
-        RamPct      = 0.0
+        RamPct      = $null
         RamUsedGB   = 0.0
         RamTotalGB  = 0.0
-        DiskBusy    = 0.0
-        DiskRead    = 0.0
-        DiskWrite   = 0.0
+        DiskBusy    = $null
+        DiskRead    = $null
+        DiskWrite   = $null
         Disks       = @()
-        DiskUsedPct = 0
+        DiskUsedPct = $null
         DiskUsedGB  = 0.0
         DiskTotalGB = 0.0
+        PrimaryDisk = ''
+        PrimaryDiskFreeGB = $null
+        DiskAlert = $false
         TempC       = $null
         TempZone    = ''
         Passive     = $null
-        NetDown     = 0.0
-        NetUp       = 0.0
+        NetDown     = $null
+        NetUp       = $null
         NetName     = ''
         IpAddress   = ''
         VpnOn       = $false
@@ -305,7 +285,7 @@ function Get-SpiritSnapshot {
         elseif ($key -like '*disk read bytes/sec') { $snap.DiskRead = [math]::Max(0, $value) }
         elseif ($key -like '*disk write bytes/sec') { $snap.DiskWrite = [math]::Max(0, $value) }
     }
-    $freq = Get-CounterMap @('\Processor Information(_Total)\Processor Frequency')
+    $freq = Get-CounterMap @('\Processor Information(_Total)\Processor Frequency') -CacheSeconds 5
     foreach ($key in $freq.Keys) {
         $snap.CpuMhz = [math]::Round([double]$freq[$key].CookedValue, 0)
     }
@@ -313,7 +293,7 @@ function Get-SpiritSnapshot {
         '\Thermal Zone Information(*)\High Precision Temperature',
         '\Thermal Zone Information(*)\Temperature',
         '\Thermal Zone Information(*)\% Passive Limit'
-    )
+    ) -CacheSeconds 5
     $bestHp = $null
     $bestPlain = $null
     $bestPassive = $null
@@ -341,43 +321,29 @@ function Get-SpiritSnapshot {
         $snap.TempZone = ($chosen.Zone -replace '^\\_tz\.', '' -replace '\\', '').ToUpperInvariant()
     }
     $snap.Passive = $bestPassive
-    $netPaths = @()
-    foreach ($track in $script:NetTracks) {
-        $netPaths += $track.Down
-        $netPaths += $track.Up
-    }
+    $netMap = Get-CounterMap @('\Network Interface(*)\Bytes Received/sec', '\Network Interface(*)\Bytes Sent/sec')
     $bestName = ''
-    if ($netPaths.Count -gt 0) {
-        $netMap = Get-CounterMap $netPaths
-        $downSum = 0.0
-        $upSum = 0.0
-        $best = 0.0
-        foreach ($track in $script:NetTracks) {
-            $down = 0.0
-            $up = 0.0
-            $dk = $track.Down.ToLowerInvariant()
-            $uk = $track.Up.ToLowerInvariant()
-            if ($netMap.ContainsKey($dk)) { $down = [math]::Max(0, [double]$netMap[$dk].CookedValue) }
-            if ($netMap.ContainsKey($uk)) { $up = [math]::Max(0, [double]$netMap[$uk].CookedValue) }
-            $downSum += $down
-            $upSum += $up
-            if (($down + $up) -gt $best) {
-                $best = $down + $up
-                $bestName = [string]$track.Name
-            }
-        }
-        $snap.NetDown = $downSum
-        $snap.NetUp = $upSum
-        if ($bestName -match 'wi-?fi|wlan|wireless') { $snap.NetName = 'Wi-Fi' }
-        elseif ($bestName -match 'ethernet') { $snap.NetName = '以太网' }
-        elseif ($bestName) { $snap.NetName = '网络' }
+    $best = -1.0
+    foreach ($sample in $netMap.Values) {
+        if ($sample.InstanceName -match 'isatap|teredo|loopback|pseudo|vethernet|wsl|bluetooth|vpn|miniport|wintun|wireguard|tap-windows|tailscale|zerotier') { continue }
+        $value = [math]::Max(0, [double]$sample.CookedValue)
+        if ($null -eq $snap.NetDown) { $snap.NetDown = 0.0; $snap.NetUp = 0.0 }
+        if ($sample.Path -like '*bytes received/sec') { $snap.NetDown += $value }
+        else { $snap.NetUp += $value }
+        if ($value -gt $best) { $best = $value; $bestName = $sample.InstanceName }
     }
+    if ($bestName -match 'wi-?fi|wlan|wireless') { $snap.NetName = 'Wi-Fi' }
+    elseif ($bestName) { $snap.NetName = '网络' }
     $links = Get-WifiVpn
     $snap.IpAddress = [string]$links.Wifi
+    $snap.IpLabel = 'Wi-Fi'
+    if (-not $snap.IpAddress) { $snap.IpAddress = Get-PreferredIPv4 $bestName; $snap.IpLabel = '本机 IP' }
+    $snap.GeoKey = if ($links.VpnOn) { ([string]$links.VpnName) + '|' + ((@($links.VpnIps) | Sort-Object) -join ',') + '|' + $snap.IpAddress } else { '' }
     $snap.VpnName = [string]$links.VpnName
     $vpnRows = @()
     if ($links.VpnOn) {
-        $geo = Update-IpCountry ([string]$links.Vpn)
+        $geo = @{ Code = ''; Name = ''; PublicIp = '' }
+        if ($GeoResult -and $GeoResult.Key -eq $snap.GeoKey) { $geo = $GeoResult.Data }
         $snap.CountryCode = [string]$geo.Code
         $snap.CountryName = [string]$geo.Name
         $publicIp = [string]$geo.PublicIp
@@ -387,7 +353,7 @@ function Get-SpiritSnapshot {
             $vpnRows += @{ Label = '上网'; Kind = 'flag'; Ip = $publicIp; Code = [string]$geo.Code; Place = [string]$geo.Name }
         }
         foreach ($tunnelIp in $tunnelIps) {
-            $vpnRows += @{ Label = '内网'; Kind = 'office'; Ip = [string]$tunnelIp; Code = ''; Place = '企业内网' }
+            $vpnRows += @{ Label = '内网'; Kind = 'office'; Ip = [string]$tunnelIp; Code = ''; Place = '隧道地址' }
         }
         if ($vpnRows.Count -eq 0 -and $links.Vpn) {
             $vpnRows += @{ Label = 'VPN'; Kind = 'flag'; Ip = [string]$links.Vpn; Code = [string]$geo.Code; Place = [string]$geo.Name }
@@ -396,10 +362,12 @@ function Get-SpiritSnapshot {
     $snap.VpnRows = $vpnRows
     $snap.VpnOn = ($vpnRows.Count -gt 0)
     $snap.VpnAddress = if ($vpnRows.Count -gt 0) { [string]$vpnRows[0].Ip } else { '' }
+    if (-not $script:DiskAt -or ([datetime]::UtcNow - $script:DiskAt).TotalSeconds -ge 30) {
     $diskRows = @()
     $diskTotal = 0.0
     $diskUsed = 0.0
     foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        try {
         if (-not $drive.IsReady) { continue }
         if ($drive.DriveType.ToString() -ne 'Fixed') { continue }
         $size = [double]$drive.TotalSize
@@ -416,52 +384,47 @@ function Get-SpiritSnapshot {
             FreeGB  = [math]::Round($free / 1GB, 1)
             SizeGB  = [math]::Round($size / 1GB, 1)
         }
+        } catch { $snap.Error = '部分磁盘暂不可用' }
     }
     $snap.Disks = $diskRows
+    $systemDisk = $diskRows | Where-Object { $_.Name -eq $env:SystemDrive } | Select-Object -First 1
+    $tightestDisk = $diskRows | Sort-Object FreeGB | Select-Object -First 1
+    $urgentDisk = $diskRows | Where-Object { $_.FreeGB -lt 10 -or $_.UsedPct -ge 90 } | Sort-Object FreeGB | Select-Object -First 1
+    $focusDisk = if ($urgentDisk) { $urgentDisk } elseif ($systemDisk) { $systemDisk } else { $tightestDisk }
+    if ($focusDisk) {
+        $snap.PrimaryDisk = [string]$focusDisk.Name
+        $snap.PrimaryDiskFreeGB = [double]$focusDisk.FreeGB
+        $snap.DiskAlert = ([double]$focusDisk.FreeGB -lt 10 -or [double]$focusDisk.UsedPct -ge 90)
+    }
     $snap.DiskUsedGB = [math]::Round($diskUsed / 1GB, 1)
     $snap.DiskTotalGB = [math]::Round($diskTotal / 1GB, 1)
     if ($diskTotal -gt 0) { $snap.DiskUsedPct = [int][math]::Round(($diskUsed / $diskTotal) * 100, 0) }
+        $script:DiskCache = @{}
+        foreach ($key in @('Disks','DiskUsedGB','DiskTotalGB','DiskUsedPct','PrimaryDisk','PrimaryDiskFreeGB','DiskAlert','Error')) { $script:DiskCache[$key] = $snap[$key] }
+        $script:DiskAt = [datetime]::UtcNow
+    } else {
+        foreach ($key in $script:DiskCache.Keys) { $snap[$key] = $script:DiskCache[$key] }
+    }
     if ($script:HasForms) {
         $power = [System.Windows.Forms.SystemInformation]::PowerStatus
         $flags = $power.BatteryChargeStatus
         $none = [System.Windows.Forms.BatteryChargeStatus]::NoSystemBattery
         $charging = [System.Windows.Forms.BatteryChargeStatus]::Charging
-        if (-not ($flags -band $none) -and $power.BatteryLifePercent -ge 0) {
+        if ($flags -ne [System.Windows.Forms.BatteryChargeStatus]::Unknown -and -not ($flags -band $none) -and $power.BatteryLifePercent -ge 0 -and $power.BatteryLifePercent -le 1) {
             $snap.HasBattery = $true
             $snap.BatteryPct = [int][math]::Round($power.BatteryLifePercent * 100, 0)
             $snap.Charging = [bool]($flags -band $charging)
             $snap.OnAc = ($power.PowerLineStatus.ToString() -eq 'Online')
         }
     }
+    $snap.SampledAt = [datetime]::UtcNow
+    $snap.SensorErrors = @{}
+    foreach ($key in $script:CounterErrors.Keys) { $snap.SensorErrors[$key] = $script:CounterErrors[$key] }
     return $snap
 }
 
 function Get-GpuBusyPercent {
-    $samples = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop).CounterSamples
-    $sums = @{}
-    foreach ($sample in $samples) {
-        $name = [string]$sample.InstanceName
-        $kind = ''
-        if ($name -match 'engtype_3d') { $kind = '3d' }
-        elseif ($name -match 'engtype_compute|engtype_VideoProcessing|engtype_videodecode') { $kind = 'media' }
-        else { continue }
-        $id = 'gpu'
-        if ($name -match 'luid_0x[0-9a-f]+_0x([0-9a-f]+)') { $id = $Matches[1] }
-        $key = $id + '|' + $kind
-        if (-not $sums.ContainsKey($key)) { $sums[$key] = 0.0 }
-        $sums[$key] += [double]$sample.CookedValue
-    }
-    $best = 0.0
-    foreach ($key in $sums.Keys) {
-        if ($key -notlike '*|3d') { continue }
-        $value = [math]::Min(100, [math]::Max(0, $sums[$key]))
-        if ($value -gt $best) { $best = $value }
-    }
-    if ($best -lt 1) {
-        foreach ($key in $sums.Keys) {
-            $value = [math]::Min(100, [math]::Max(0, $sums[$key]))
-            if ($value -gt $best) { $best = $value }
-        }
-    }
-    return [math]::Round($best, 0)
+    $map = Get-CounterMap @('\GPU Engine(*)\Utilization Percentage')
+    if ($script:CounterErrors['GPU Engine']) { throw $script:CounterErrors['GPU Engine'] }
+    return Get-GpuAggregate @($map.Values)
 }

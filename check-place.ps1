@@ -1,4 +1,4 @@
-. (Join-Path $PSScriptRoot 'sensors.ps1')
+﻿. (Join-Path $PSScriptRoot 'sensors.ps1')
 $samples = @(
     @{ c = 'CN'; r = 'Shanghai'; city = 'Shanghai' },
     @{ c = 'CN'; r = 'Hong Kong'; city = 'Hong Kong' },

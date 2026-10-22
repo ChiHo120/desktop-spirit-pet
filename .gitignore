@@ -23,3 +23,6 @@
 Thumbs.db
 Desktop.ini
 *.tmp
+
+# Internal review notes
+/用户体验审阅.md
